@@ -82,6 +82,9 @@ let config = {
     SUNRAYS: true,
     SUNRAYS_RESOLUTION: 196,
     SUNRAYS_WEIGHT: 1.0,
+    // NEW: debug overlay + path
+    SHOW_OBSTACLES: true,
+    OBSTACLE_PATH: 'pattern.png',
 }
 
 function pointerPrototype () {
@@ -102,6 +105,9 @@ let splatStack = [];
 pointers.push(new pointerPrototype());
 
 const { gl, ext } = getWebGLContext(canvas);
+
+// ADD: obstacle texture handle
+let obstacles = null;
 
 if (isMobile()) {
     config.DYE_RESOLUTION = 512;
@@ -217,6 +223,9 @@ function startGUI () {
     gui.add(config, 'SHADING').name('shading').onFinishChange(updateKeywords);
     gui.add(config, 'COLORFUL').name('colorful');
     gui.add(config, 'PAUSED').name('paused').listen();
+    // NEW
+    gui.add(config, 'SHOW_OBSTACLES').name('show obstacles');
+    gui.add(config, 'OBSTACLE_PATH').name('obstacle path').onFinishChange(initFramebuffers);
 
     gui.add({ fun: () => {
         splatStack.push(parseInt(Math.random() * 20) + 5);
@@ -422,8 +431,9 @@ function compileShader (type, source, keywords) {
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
 
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+    if (!gl.getShaderParameter(shader, gl.COMPLETE_STATUS) && !gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
         console.trace(gl.getShaderInfoLog(shader));
+    }
 
     return shader;
 };
@@ -743,6 +753,7 @@ const splatShader = compileShader(gl.FRAGMENT_SHADER, `
     }
 `);
 
+// MODIFIED: advectionShader with obstacle sampling
 const advectionShader = compileShader(gl.FRAGMENT_SHADER, `
     precision highp float;
     precision highp sampler2D;
@@ -750,10 +761,16 @@ const advectionShader = compileShader(gl.FRAGMENT_SHADER, `
     varying vec2 vUv;
     uniform sampler2D uVelocity;
     uniform sampler2D uSource;
+    uniform sampler2D uObstacles; // NEW
     uniform vec2 texelSize;
     uniform vec2 dyeTexelSize;
     uniform float dt;
     uniform float dissipation;
+
+    float isSolid(vec2 uv) {
+        // black = solid (air = white)
+        return step(0.5, 1.0 - texture2D(uObstacles, uv).r);
+    }
 
     vec4 bilerp (sampler2D sam, vec2 uv, vec2 tsize) {
         vec2 st = uv / tsize - 0.5;
@@ -770,11 +787,14 @@ const advectionShader = compileShader(gl.FRAGMENT_SHADER, `
     }
 
     void main () {
+        if (isSolid(vUv) > 0.5) { gl_FragColor = vec4(0.0); return; }
     #ifdef MANUAL_FILTERING
-        vec2 coord = vUv - dt * bilerp(uVelocity, vUv, texelSize).xy * texelSize;
+        vec2 vel = bilerp(uVelocity, vUv, texelSize).xy;
+        vec2 coord = vUv - dt * vel * texelSize;
         vec4 result = bilerp(uSource, coord, dyeTexelSize);
     #else
-        vec2 coord = vUv - dt * texture2D(uVelocity, vUv).xy * texelSize;
+        vec2 vel = texture2D(uVelocity, vUv).xy;
+        vec2 coord = vUv - dt * vel * texelSize;
         vec4 result = texture2D(uSource, coord);
     #endif
         float decay = 1.0 + dissipation * dt;
@@ -793,18 +813,26 @@ const divergenceShader = compileShader(gl.FRAGMENT_SHADER, `
     varying highp vec2 vT;
     varying highp vec2 vB;
     uniform sampler2D uVelocity;
+    uniform sampler2D uObstacles; // NEW
+
+    float isSolid(vec2 uv) {
+        return step(0.5, 1.0 - texture2D(uObstacles, uv).r);
+    }
 
     void main () {
-        float L = texture2D(uVelocity, vL).x;
-        float R = texture2D(uVelocity, vR).x;
-        float T = texture2D(uVelocity, vT).y;
-        float B = texture2D(uVelocity, vB).y;
+        if (isSolid(vUv) > 0.5) { gl_FragColor = vec4(0.0); return; }
 
         vec2 C = texture2D(uVelocity, vUv).xy;
-        if (vL.x < 0.0) { L = -C.x; }
-        if (vR.x > 1.0) { R = -C.x; }
-        if (vT.y > 1.0) { T = -C.y; }
-        if (vB.y < 0.0) { B = -C.y; }
+
+        float Ls = isSolid(vL);
+        float Rs = isSolid(vR);
+        float Ts = isSolid(vT);
+        float Bs = isSolid(vB);
+
+        float L = Ls > 0.5 ? -C.x : texture2D(uVelocity, vL).x;
+        float R = Rs > 0.5 ? -C.x : texture2D(uVelocity, vR).x;
+        float T = Ts > 0.5 ? -C.y : texture2D(uVelocity, vT).y;
+        float B = Bs > 0.5 ? -C.y : texture2D(uVelocity, vB).y;
 
         float div = 0.5 * (R - L + T - B);
         gl_FragColor = vec4(div, 0.0, 0.0, 1.0);
@@ -865,6 +893,7 @@ const vorticityShader = compileShader(gl.FRAGMENT_SHADER, `
     }
 `);
 
+// MODIFIED: pressureShader with obstacle support
 const pressureShader = compileShader(gl.FRAGMENT_SHADER, `
     precision mediump float;
     precision mediump sampler2D;
@@ -876,19 +905,26 @@ const pressureShader = compileShader(gl.FRAGMENT_SHADER, `
     varying highp vec2 vB;
     uniform sampler2D uPressure;
     uniform sampler2D uDivergence;
+    uniform sampler2D uObstacles; // NEW
+
+    float isSolid(vec2 uv) {
+        return step(0.5, 1.0 - texture2D(uObstacles, uv).r);
+    }
 
     void main () {
-        float L = texture2D(uPressure, vL).x;
-        float R = texture2D(uPressure, vR).x;
-        float T = texture2D(uPressure, vT).x;
-        float B = texture2D(uPressure, vB).x;
-        float C = texture2D(uPressure, vUv).x;
+        if (isSolid(vUv) > 0.5) { gl_FragColor = vec4(0.0); return; }
+
+        float L = isSolid(vL) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vL).x;
+        float R = isSolid(vR) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vR).x;
+        float T = isSolid(vT) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vT).x;
+        float B = isSolid(vB) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vB).x;
         float divergence = texture2D(uDivergence, vUv).x;
         float pressure = (L + R + B + T - divergence) * 0.25;
         gl_FragColor = vec4(pressure, 0.0, 0.0, 1.0);
     }
 `);
 
+// MODIFIED: gradientSubtractShader with obstacle support
 const gradientSubtractShader = compileShader(gl.FRAGMENT_SHADER, `
     precision mediump float;
     precision mediump sampler2D;
@@ -900,17 +936,37 @@ const gradientSubtractShader = compileShader(gl.FRAGMENT_SHADER, `
     varying highp vec2 vB;
     uniform sampler2D uPressure;
     uniform sampler2D uVelocity;
+    uniform sampler2D uObstacles; // NEW
+
+    float isSolid(vec2 uv) {
+        return step(0.5, 1.0 - texture2D(uObstacles, uv).r);
+    }
 
     void main () {
-        float L = texture2D(uPressure, vL).x;
-        float R = texture2D(uPressure, vR).x;
-        float T = texture2D(uPressure, vT).x;
-        float B = texture2D(uPressure, vB).x;
+        if (isSolid(vUv) > 0.5) { gl_FragColor = vec4(0.0); return; }
+        float L = isSolid(vL) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vL).x;
+        float R = isSolid(vR) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vR).x;
+        float T = isSolid(vT) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vT).x;
+        float B = isSolid(vB) > 0.5 ? texture2D(uPressure, vUv).x : texture2D(uPressure, vB).x;
         vec2 velocity = texture2D(uVelocity, vUv).xy;
         velocity.xy -= vec2(R - L, T - B);
         gl_FragColor = vec4(velocity, 0.0, 1.0);
     }
 `);
+
+// NEW: simple program to display the obstacle mask as an overlay
+const obstacleDisplayShader = compileShader(gl.FRAGMENT_SHADER, `
+    precision mediump float;
+    precision mediump sampler2D;
+    varying highp vec2 vUv;
+    uniform sampler2D uObstacles;
+    void main () {
+        float solid = step(0.5, 1.0 - texture2D(uObstacles, vUv).r);
+        vec3 col = mix(vec3(0.0), vec3(0.85), solid);
+        gl_FragColor = vec4(col, solid * 0.75);
+    }
+`);
+const obstacleDisplayProgram = new Program(baseVertexShader, obstacleDisplayShader);
 
 const blit = (() => {
     gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
@@ -979,6 +1035,52 @@ const gradienSubtractProgram = new Program(baseVertexShader, gradientSubtractSha
 
 const displayMaterial = new Material(baseVertexShader, displayShaderSource);
 
+// ADD: Create obstacle texture builder
+function createObstacleTexture (url, w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    // NEAREST keeps hard block edges
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // initialize white (air) so we don't block before load
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = w; c.height = h;
+        const ctx = c.getContext('2d');
+        // Fill air white, draw pattern (assumed black blocks on white bg)
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        const data = ctx.getImageData(0, 0, w, h);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); // match vUv orientation
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data.data);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        console.log('[obstacles] loaded', url, '->', w, 'x', h);
+    };
+    img.onerror = (e) => {
+        console.error('[obstacles] failed to load', url, e);
+    };
+    img.src = url;
+
+    return {
+        texture: tex,
+        width: w,
+        height: h,
+        attach (unit) {
+            gl.activeTexture(gl.TEXTURE0 + unit);
+            gl.bindTexture(gl.TEXTURE_2D, tex);
+            return unit;
+        }
+    };
+}
+
 function initFramebuffers () {
     let simRes = getResolution(config.SIM_RESOLUTION);
     let dyeRes = getResolution(config.DYE_RESOLUTION);
@@ -1007,6 +1109,9 @@ function initFramebuffers () {
 
     initBloomFramebuffers();
     initSunraysFramebuffers();
+
+    // (re)create obstacle texture at simulation resolution
+    obstacles = createObstacleTexture(config.OBSTACLE_PATH, simRes.width, simRes.height);
 }
 
 function initBloomFramebuffers () {
@@ -1248,6 +1353,7 @@ function step (dt) {
     divergenceProgram.bind();
     gl.uniform2f(divergenceProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(divergenceProgram.uniforms.uVelocity, velocity.read.attach(0));
+    if (obstacles) gl.uniform1i(divergenceProgram.uniforms.uObstacles, obstacles.attach(3));
     blit(divergence);
 
     clearProgram.bind();
@@ -1259,6 +1365,7 @@ function step (dt) {
     pressureProgram.bind();
     gl.uniform2f(pressureProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(pressureProgram.uniforms.uDivergence, divergence.attach(0));
+    if (obstacles) gl.uniform1i(pressureProgram.uniforms.uObstacles, obstacles.attach(3));
     for (let i = 0; i < config.PRESSURE_ITERATIONS; i++) {
         gl.uniform1i(pressureProgram.uniforms.uPressure, pressure.read.attach(1));
         blit(pressure.write);
@@ -1269,6 +1376,7 @@ function step (dt) {
     gl.uniform2f(gradienSubtractProgram.uniforms.texelSize, velocity.texelSizeX, velocity.texelSizeY);
     gl.uniform1i(gradienSubtractProgram.uniforms.uPressure, pressure.read.attach(0));
     gl.uniform1i(gradienSubtractProgram.uniforms.uVelocity, velocity.read.attach(1));
+    if (obstacles) gl.uniform1i(gradienSubtractProgram.uniforms.uObstacles, obstacles.attach(3));
     blit(velocity.write);
     velocity.swap();
 
@@ -1279,6 +1387,7 @@ function step (dt) {
     let velocityId = velocity.read.attach(0);
     gl.uniform1i(advectionProgram.uniforms.uVelocity, velocityId);
     gl.uniform1i(advectionProgram.uniforms.uSource, velocityId);
+    if (obstacles) gl.uniform1i(advectionProgram.uniforms.uObstacles, obstacles.attach(3));
     gl.uniform1f(advectionProgram.uniforms.dt, dt);
     gl.uniform1f(advectionProgram.uniforms.dissipation, config.VELOCITY_DISSIPATION);
     blit(velocity.write);
@@ -1288,6 +1397,7 @@ function step (dt) {
         gl.uniform2f(advectionProgram.uniforms.dyeTexelSize, dye.texelSizeX, dye.texelSizeY);
     gl.uniform1i(advectionProgram.uniforms.uVelocity, velocity.read.attach(0));
     gl.uniform1i(advectionProgram.uniforms.uSource, dye.read.attach(1));
+    if (obstacles) gl.uniform1i(advectionProgram.uniforms.uObstacles, obstacles.attach(3));
     gl.uniform1f(advectionProgram.uniforms.dissipation, config.DENSITY_DISSIPATION);
     blit(dye.write);
     dye.swap();
@@ -1314,6 +1424,14 @@ function render (target) {
     if (target == null && config.TRANSPARENT)
         drawCheckerboard(target);
     drawDisplay(target);
+
+    // NEW: optional obstacle overlay
+    if (config.SHOW_OBSTACLES && obstacles) {
+        obstacleDisplayProgram.bind();
+        gl.uniform2f(obstacleDisplayProgram.uniforms.texelSize, 1.0 / (target ? target.width : gl.drawingBufferWidth), 1.0 / (target ? target.height : gl.drawingBufferHeight));
+        gl.uniform1i(obstacleDisplayProgram.uniforms.uObstacles, obstacles.attach(4));
+        blit(target);
+    }
 }
 
 function drawColor (target, color) {
@@ -1643,4 +1761,4 @@ function hashCode (s) {
         hash |= 0; // Convert to 32bit integer
     }
     return hash;
-};
+}
